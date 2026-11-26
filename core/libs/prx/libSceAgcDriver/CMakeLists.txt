@@ -131,7 +131,7 @@ if(BUILD_TESTING)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/tests/CMakeLists.txt)
         add_subdirectory(KytyShim/tests)
     endif()
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/src/MemoryTests.cpp)
+    if((CMAKE_SYSTEM_NAME STREQUAL "Linux" OR WIN32) AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/src/MemoryTests.cpp)
         add_test_executable(kyty_shim_memory_tests
                 KytyShim/src/MemoryTests.cpp
                 KytyShim/src/MemoryView.cpp
@@ -141,21 +141,23 @@ if(BUILD_TESTING)
         set_target_properties(kyty_shim_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
         add_test(NAME kyty_shim_memory COMMAND kyty_shim_memory_tests)
         set_tests_properties(kyty_shim_memory PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_DIRECT_MEMORY_PAGES=demand")
-        add_test(NAME kyty_shim_memory_plain_reads COMMAND kyty_shim_memory_tests)
-        set_tests_properties(kyty_shim_memory_plain_reads PROPERTIES TIMEOUT 20 ENVIRONMENT "ANYPS5_KYTY_SPARSE_READS=0;KYTY_DIRECT_MEMORY_PAGES=demand")
-        add_test_executable(kyty_shim_lod_stats_destination_tests
-                KytyShim/tests/LodStatsDestination.cpp
-                KytyShim/src/MemoryView.cpp
-                KytyShim/src/Log.cpp)
-        target_include_directories(kyty_shim_lod_stats_destination_tests PRIVATE ${LIBS_INCLUDE_DIR} ${LIBS_INCLUDE_DIR}/nid/include)
-        target_link_libraries(kyty_shim_lod_stats_destination_tests PRIVATE $<IF:$<TARGET_EXISTS:Kyty::gpu>,Kyty::gpu,kyty_gpu> libkernel libc)
-        set_target_properties(kyty_shim_lod_stats_destination_tests PROPERTIES CXX_EXTENSIONS OFF)
-        add_test(NAME kyty_shim_lod_stats_destination COMMAND kyty_shim_lod_stats_destination_tests)
-        set_tests_properties(kyty_shim_lod_stats_destination PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_lod_stats_destination: ok"
-                FAIL_REGULAR_EXPRESSION "FAILED")
-        add_test(NAME kyty_shim_memory_sparse_reads_switch
-                COMMAND sh -c "\"$0\" 2>&1 | grep -q 'ANYPS5_KYTY_SPARSE_READS=2 is neither 0 nor 1'" $<TARGET_FILE:kyty_shim_memory_tests>)
-        set_tests_properties(kyty_shim_memory_sparse_reads_switch PROPERTIES TIMEOUT 20 ENVIRONMENT "ANYPS5_KYTY_SPARSE_READS=2;KYTY_DIRECT_MEMORY_PAGES=demand")
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_test(NAME kyty_shim_memory_plain_reads COMMAND kyty_shim_memory_tests)
+            set_tests_properties(kyty_shim_memory_plain_reads PROPERTIES TIMEOUT 20 ENVIRONMENT "ANYPS5_KYTY_SPARSE_READS=0;KYTY_DIRECT_MEMORY_PAGES=demand")
+            add_test_executable(kyty_shim_lod_stats_destination_tests
+                    KytyShim/tests/LodStatsDestination.cpp
+                    KytyShim/src/MemoryView.cpp
+                    KytyShim/src/Log.cpp)
+            target_include_directories(kyty_shim_lod_stats_destination_tests PRIVATE ${LIBS_INCLUDE_DIR} ${LIBS_INCLUDE_DIR}/nid/include)
+            target_link_libraries(kyty_shim_lod_stats_destination_tests PRIVATE $<IF:$<TARGET_EXISTS:Kyty::gpu>,Kyty::gpu,kyty_gpu> libkernel libc)
+            set_target_properties(kyty_shim_lod_stats_destination_tests PROPERTIES CXX_EXTENSIONS OFF)
+            add_test(NAME kyty_shim_lod_stats_destination COMMAND kyty_shim_lod_stats_destination_tests)
+            set_tests_properties(kyty_shim_lod_stats_destination PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_lod_stats_destination: ok"
+                    FAIL_REGULAR_EXPRESSION "FAILED")
+            add_test(NAME kyty_shim_memory_sparse_reads_switch
+                    COMMAND sh -c "\"$0\" 2>&1 | grep -q 'ANYPS5_KYTY_SPARSE_READS=2 is neither 0 nor 1'" $<TARGET_FILE:kyty_shim_memory_tests>)
+            set_tests_properties(kyty_shim_memory_sparse_reads_switch PROPERTIES TIMEOUT 20 ENVIRONMENT "ANYPS5_KYTY_SPARSE_READS=2;KYTY_DIRECT_MEMORY_PAGES=demand")
+        endif()
     endif()
 endif()
 if(NOT ANYPS5_KYTY_DLL)

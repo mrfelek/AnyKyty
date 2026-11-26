@@ -1,7 +1,53 @@
+#ifdef _WIN32
+#include "kernel/memory.h"
+
+#include "MemoryShim.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <windows.h>
+
+namespace Memory = Libs::LibKernel::Memory;
+
+int main() {
+    constexpr std::size_t Page = 0x4000;
+    constexpr std::size_t bytes = Page * 4;
+    constexpr auto offset = 11u;
+    if (!Memory::Shim::ViewEnabled()) std::abort();
+    void* heap = GuestArena::GuestArenaAllocate_nid_postfix(bytes, bytes);
+    if (heap == nullptr) std::abort();
+    GuestArena::GuestArenaCommit_nid_postfix(heap, bytes, PAGE_READWRITE, bytes);
+    auto* pages = static_cast<std::uint8_t*>(heap);
+    const auto address = reinterpret_cast<std::uintptr_t>(heap) + offset;
+    const auto size = bytes - offset;
+    const auto backing_epoch = Memory::BackingEpoch();
+    if (Memory::IsBackingReadable(address, size)) std::abort();
+    for (int i = 0; i < 8; ++i) {
+        if (Memory::ClampRangeSize(address, size) != size) std::abort();
+    }
+    DWORD previous = 0;
+    if (VirtualProtect(pages + Page, Page, PAGE_NOACCESS, &previous) == 0 || Memory::BackingEpoch() != backing_epoch) std::abort();
+    for (int i = 0; i < 8; ++i) {
+        if (Memory::ClampRangeSize(address, size) != Page - offset) std::abort();
+    }
+    if (VirtualProtect(pages + Page, Page, previous, &previous) == 0 || Memory::BackingEpoch() != backing_epoch) std::abort();
+    for (int i = 0; i < 8; ++i) {
+        if (Memory::ClampRangeSize(address, size) != size) std::abort();
+    }
+    GuestArena::GuestArenaReset_nid_postfix(heap, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(heap, bytes);
+    std::printf("Windows unreported range: repeated clamps follow VirtualProtect without a backing callback\n");
+    return 0;
+}
+#else
 #include "kernel/memory.h"
 
 #include "MemoryShim.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -12,6 +58,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -774,11 +821,24 @@ void TestClampRememberedUntilViewChange() {
     Require(heap != nullptr);
     const auto address = Address(heap) + offset;
     const auto size = bytes - offset;
+    std::atomic<int> requested {0};
+    std::atomic<int> observed {0};
+    std::atomic<std::uint64_t> answer {0};
+    std::thread reader([&] {
+        for (int phase = 1; phase <= 4; ++phase) {
+            while (requested.load(std::memory_order_acquire) != phase) std::this_thread::yield();
+            const auto result = Memory::ClampRangeSize(address, size);
+            for (int i = 0; i < 3; ++i) Require(Memory::ClampRangeSize(address, size) == result);
+            answer.store(result, std::memory_order_relaxed);
+            observed.store(phase, std::memory_order_release);
+        }
+    });
+    int phase = 0;
     const auto expect = [&](std::uint64_t mapped) {
         for (int i = 0; i < 4; ++i) Require(Memory::ClampRangeSize(address, size) == mapped);
-        std::uint64_t other = 0;
-        std::thread([&] { other = Memory::ClampRangeSize(address, size); }).join();
-        Require(other == mapped);
+        requested.store(++phase, std::memory_order_release);
+        while (observed.load(std::memory_order_acquire) != phase) std::this_thread::yield();
+        Require(answer.load(std::memory_order_relaxed) == mapped);
     };
     GuestArena::GuestArenaCommit_nid_postfix(heap, Page, 0x04, Page);
     expect(Page - offset);
@@ -788,9 +848,66 @@ void TestClampRememberedUntilViewChange() {
     expect(Page * 2 - offset);
     GuestArena::GuestArenaCommit_nid_postfix(heap, bytes, 0x04, bytes);
     expect(size);
+    reader.join();
     GuestArena::GuestArenaReset_nid_postfix(heap, bytes);
     GuestArena::GuestArenaRelease_nid_postfix(heap, bytes);
-    std::printf("clamped range 0x%llx: the remembered mapped length follows every commit and reset, on this thread and another\n", static_cast<unsigned long long>(address));
+    std::printf("clamped range 0x%llx: one reader thread keeps its remembered length current across commits and resets\n", static_cast<unsigned long long>(address));
+}
+
+void TestClampProtectionOnlyChange() {
+    constexpr std::size_t bytes = Page * 4;
+    constexpr auto offset = 11u;
+    void* reserved = GuestArena::GuestArenaAllocate_nid_postfix(bytes, Page);
+    Require(reserved != nullptr);
+    MapUnreported(reserved, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(reserved, bytes, true, true, false);
+    }
+    auto* pages = static_cast<std::uint8_t*>(reserved);
+    const auto address = Address(pages) + offset;
+    const auto size = bytes - offset;
+    const auto epoch = Memory::BackingEpoch();
+    Require(sceKernelMprotect(reserved, bytes, CpuReadWrite) == 0);
+    Require(!Memory::IsBackingReadable(Address(reserved), bytes) && Memory::BackingEpoch() == epoch);
+    for (int i = 0; i < 8; ++i) Require(Memory::ClampRangeSize(address, size) == size);
+    Require(sceKernelMprotect(pages + Page * 2, Page * 2, 0) == 0);
+    Require(Memory::BackingEpoch() == epoch);
+    for (int i = 0; i < 8; ++i) Require(Memory::ClampRangeSize(address, size) == Page * 2 - offset);
+    Require(sceKernelMprotect(pages + Page * 2, Page * 2, CpuReadWrite) == 0);
+    Require(Memory::BackingEpoch() == epoch);
+    for (int i = 0; i < 8; ++i) Require(Memory::ClampRangeSize(address, size) == size);
+    std::atomic<bool> running {true};
+    std::atomic<int> requested {0};
+    std::atomic<int> observed {0};
+    std::atomic<std::uint64_t> answer {0};
+    std::thread reader([&] {
+        while (running.load(std::memory_order_acquire)) {
+            const auto request = requested.load(std::memory_order_acquire);
+            const auto result = Memory::ClampRangeSize(address, size);
+            if (request != observed.load(std::memory_order_relaxed) && requested.load(std::memory_order_acquire) == request) {
+                answer.store(result, std::memory_order_relaxed);
+                observed.store(request, std::memory_order_release);
+            }
+        }
+    });
+    for (int cycle = 1; cycle <= 64; ++cycle) {
+        const bool writable = (cycle & 1) == 0;
+        Require(sceKernelMprotect(pages + Page * 2, Page * 2, writable ? CpuReadWrite : 0) == 0);
+        Require(Memory::BackingEpoch() == epoch);
+        requested.store(cycle, std::memory_order_release);
+        while (observed.load(std::memory_order_acquire) != cycle) std::this_thread::yield();
+        Require(answer.load(std::memory_order_relaxed) == (writable ? size : Page * 2 - offset));
+    }
+    running.store(false, std::memory_order_release);
+    reader.join();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(reserved);
+    }
+    GuestArena::GuestArenaReset_nid_postfix(reserved, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(reserved, bytes);
+    std::printf("clamped range 0x%llx: protection-only changes invalidate the remembered length without a backing change\n", static_cast<unsigned long long>(address));
 }
 
 void TestGuestCopyOut() {
@@ -1163,6 +1280,7 @@ int main() {
     TestHostView();
     TestUnreportedPrivateMemory();
     TestClampRememberedUntilViewChange();
+    TestClampProtectionOnlyChange();
     TestGuestCopyOut();
     TestNoCrossWaitWithGpuThread();
     TestSparseReadsGuestFile();
@@ -1174,3 +1292,4 @@ int main() {
     std::printf("KytyShim memory: all checks passed\n");
     return 0;
 }
+#endif

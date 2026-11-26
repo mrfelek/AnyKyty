@@ -56,8 +56,8 @@ constexpr uint64_t BucketCount = ((kExtendedMemoryBase + kExtendedMemorySize) >>
 constexpr uint32_t PrivateEntry = ~uint32_t {0};
 constexpr uint64_t HostPageSize = 0x1000;
 constexpr uint64_t HostPageMask = HostPageSize - 1u;
-constexpr size_t ProbeBatch = 512;
 #ifndef _WIN32
+constexpr size_t ProbeBatch = 512;
 constexpr uint64_t SeekMinBytes = uint64_t {64} << 10u;
 constexpr uint64_t SeekFirstChunk = uint64_t {64} << 10u;
 constexpr uint64_t SeekLastChunk = uint64_t {1} << 20u;
@@ -285,14 +285,19 @@ ViewState& State() {
 	return *state;
 }
 
-std::atomic<uint64_t> g_probe_epoch {0};
 std::atomic<uint64_t> g_probe_calls {0};
+#ifndef _WIN32
+std::atomic<uint64_t> g_probe_epoch {0};
 std::atomic<bool> g_any_probe {false};
+std::mutex g_probe_invalidation_mutex;
 
 void ForgetProbes(uint64_t start, uint64_t size) {
+	GuestDeliveryLock lock(g_probe_invalidation_mutex);
 	g_probe_epoch.fetch_add(1, std::memory_order_seq_cst);
 	if (g_any_probe.load(std::memory_order_seq_cst)) Pages().ClearProbes(start, start + size);
+	g_probe_epoch.fetch_add(1, std::memory_order_seq_cst);
 }
+#endif
 
 std::atomic<uint64_t> g_backing_epoch {0};
 constexpr uint64_t BackingChangeHistory = 4096;
@@ -522,9 +527,13 @@ uint64_t ReadablePrefix(uint64_t start, uint64_t end) {
 		const iovec local {sink.data(), count};
 		const auto read = ReadOwnMemory(local, remote.data(), count);
 		const auto known_end = std::min(read + 1u, count);
-		for (size_t i = 0; i < known_end; ++i) pages.StoreProbe(reinterpret_cast<std::uintptr_t>(remote[i].iov_base), i < read);
 		const auto probed_end = (reinterpret_cast<std::uintptr_t>(remote[known_end - 1u].iov_base) | HostPageMask) + 1u;
-		if (g_probe_epoch.load(std::memory_order_seq_cst) != epoch) pages.ClearProbes(cursor, probed_end);
+		{
+			GuestDeliveryLock lock(g_probe_invalidation_mutex);
+			if ((epoch & 1u) == 0 && g_probe_epoch.load(std::memory_order_seq_cst) == epoch) {
+				for (size_t i = 0; i < known_end; ++i) pages.StoreProbe(reinterpret_cast<std::uintptr_t>(remote[i].iov_base), i < read);
+			}
+		}
 		if (read < count) return reinterpret_cast<std::uintptr_t>(remote[read].iov_base) - start;
 		cursor = probed_end;
 	}
@@ -642,7 +651,9 @@ void OnViewChange(std::uintptr_t address, std::size_t bytes, std::uint64_t offse
 	}
 	GuestDeliveryLock lock(HookMutex());
 	auto& pages = Pages();
+#ifndef _WIN32
 	ForgetProbes(address, bytes);
+#endif
 	if (offset == DirectMemoryViewReplacing) {
 		if (pages.AnyMapped(address, bytes)) {
 			if (g_unmap_hook != nullptr) g_unmap_hook(address, bytes);
@@ -679,7 +690,9 @@ void OnProtectionChange(std::uintptr_t address, std::size_t bytes, int protectio
 		Shim::Fail("KytyShim memory: libkernel reported a protection change 0x%016" PRIx64 "+0x%zx past the address space\n", static_cast<uint64_t>(address), bytes);
 	}
 	Pages().StoreExecutable(address, address + bytes, protection >= 0 && (protection & 0x04) != 0);
+#ifndef _WIN32
 	ForgetProbes(address, bytes);
+#endif
 }
 
 void EnableViewOnce() {
@@ -921,8 +934,8 @@ bool IsFullyMapped(uint64_t vaddr, uint64_t size) {
 	return Shim::IsBacked(vaddr, size) || MappedPrefix(vaddr, size) == size;
 }
 
+#ifndef _WIN32
 namespace {
-
 struct RememberedPrefix {
 	uint64_t vaddr = 0;
 	uint64_t size = 0;
@@ -932,21 +945,26 @@ struct RememberedPrefix {
 };
 
 }
+#endif
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	if (!ValidRange(vaddr, size)) {
 		Shim::Fail("KytyShim memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64 "\n", vaddr, size);
 	}
+#ifndef _WIN32
 	thread_local std::array<RememberedPrefix, 256> remembered {};
 	const auto probe_epoch = g_probe_epoch.load(std::memory_order_seq_cst);
 	const auto backing_epoch = g_backing_epoch.load(std::memory_order_acquire);
 	auto& slot = remembered[((vaddr >> PageBits) ^ (size * 0x9e3779b97f4a7c15ull >> 56u)) & 255u];
-	if (slot.vaddr == vaddr && slot.size == size && slot.probe_epoch == probe_epoch && slot.backing_epoch == backing_epoch) return slot.prefix;
+	if ((probe_epoch & 1u) == 0 && slot.vaddr == vaddr && slot.size == size && slot.probe_epoch == probe_epoch && slot.backing_epoch == backing_epoch) return slot.prefix;
+#endif
 	if (Shim::IsBacked(vaddr, size)) return size;
 	const auto clamped = MappedPrefix(vaddr, size);
-	if (clamped != 0 && g_probe_epoch.load(std::memory_order_seq_cst) == probe_epoch && g_backing_epoch.load(std::memory_order_acquire) == backing_epoch) {
+#ifndef _WIN32
+	if (clamped != 0 && (probe_epoch & 1u) == 0 && g_probe_epoch.load(std::memory_order_seq_cst) == probe_epoch && g_backing_epoch.load(std::memory_order_acquire) == backing_epoch) {
 		slot = {vaddr, size, clamped, probe_epoch, backing_epoch};
 	}
+#endif
 	if (clamped == size) return size;
 	if (clamped == 0) {
 		Shim::Fail("KytyShim memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64 "\n", vaddr, size);
